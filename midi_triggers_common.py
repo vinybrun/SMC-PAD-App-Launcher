@@ -7,8 +7,6 @@ import re
 import mido
 
 
-BUTTON_CCS = {25, 26, 27, 28, 29}
-KNOB_CCS = {38, 39, 40, 41, 42, 43, 44, 45}
 PORT_SUFFIX_RE = re.compile(r" \d+:\d+$")
 
 
@@ -77,15 +75,44 @@ def describe_event(event: NormalizedEvent) -> str:
     return f"{event.kind} ({event.id})"
 
 
+def cc_sets_from_config(config: dict) -> tuple[frozenset[int], frozenset[int]]:
+    """Return (knob_ccs, button_ccs) from an explicit config or infer from bindings."""
+    knob_ccs = config.get("knob_ccs")
+    button_ccs = config.get("button_ccs")
+
+    if knob_ccs is not None or button_ccs is not None:
+        return frozenset(knob_ccs or []), frozenset(button_ccs or [])
+
+    inferred_knobs: set[int] = set()
+    inferred_buttons: set[int] = set()
+    for trigger_id, binding in config.get("bindings", {}).items():
+        if not trigger_id.startswith("cc:"):
+            continue
+        try:
+            cc = int(trigger_id.split(":", 1)[1])
+        except ValueError:
+            continue
+        kind = binding.get("kind", "")
+        if kind == "knob_moved":
+            inferred_knobs.add(cc)
+        elif kind == "button_pressed":
+            inferred_buttons.add(cc)
+
+    return frozenset(inferred_knobs), frozenset(inferred_buttons)
+
+
 def normalize_message(
     msg: mido.Message,
     state: ActivePadState | None = None,
+    *,
+    knob_ccs: frozenset[int] = frozenset(),
+    button_ccs: frozenset[int] = frozenset(),
 ) -> NormalizedEvent | None:
     if msg.type == "control_change":
         control = getattr(msg, "control", None)
         value = getattr(msg, "value", 0)
 
-        if control in KNOB_CCS:
+        if control in knob_ccs:
             return NormalizedEvent(
                 kind="knob_moved",
                 id=f"cc:{control}",
@@ -93,7 +120,7 @@ def normalize_message(
                 control=control,
             )
 
-        if control in BUTTON_CCS and value > 0:
+        if control in button_ccs and value > 0:
             return NormalizedEvent(
                 kind="button_pressed",
                 id=f"cc:{control}",
@@ -184,3 +211,4 @@ def resolve_input_port_name(configured_name: str, available_names: list[str] | N
         if not matches
         else f"Configured MIDI input '{configured_name}' matched multiple ports: {', '.join(matches)}"
     )
+

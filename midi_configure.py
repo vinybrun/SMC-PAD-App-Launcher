@@ -11,6 +11,8 @@ import mido
 
 from midi_triggers_common import (
     ActivePadState,
+    NormalizedEvent,
+    cc_sets_from_config,
     choose_port_interactively,
     default_cooldown_for_kind,
     describe_event,
@@ -26,6 +28,8 @@ SERVICE_NAME = "midi-execute.service"
 def empty_config(port: str = "") -> dict:
     return {
         "port": port,
+        "knob_ccs": [],
+        "button_ccs": [],
         "cooldowns": {},
         "bindings": {},
     }
@@ -33,8 +37,10 @@ def empty_config(port: str = "") -> dict:
 
 def normalize_config(config: dict) -> tuple[dict, bool]:
     if "bindings" in config:
-        return {
+        result = {
             "port": config.get("port", ""),
+            "knob_ccs": sorted(set(config.get("knob_ccs", []))),
+            "button_ccs": sorted(set(config.get("button_ccs", []))),
             "cooldowns": {
                 str(trigger_id): float(value)
                 for trigger_id, value in config.get("cooldowns", {}).items()
@@ -46,7 +52,12 @@ def normalize_config(config: dict) -> tuple[dict, bool]:
                 }
                 for trigger_id, binding in config.get("bindings", {}).items()
             },
-        }, False
+        }
+        if not result["knob_ccs"] and not result["button_ccs"]:
+            knob, button = cc_sets_from_config(result)
+            result["knob_ccs"] = sorted(knob)
+            result["button_ccs"] = sorted(button)
+        return result, False
 
     return empty_config(port=config.get("port", "")), "commands" in config
 
@@ -225,7 +236,32 @@ def select_binding_ids(config: dict, prompt: str) -> list[str] | None:
     return selected_ids
 
 
-def capture_one_trigger(port_name: str) -> tuple[str, str]:
+def auto_classify_cc(
+    port, control: int, first_value: int, timeout: float = 0.4,
+) -> str:
+    """Collect CC events briefly and decide if a control is a knob or button."""
+    seen_values = {first_value}
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        msg = port.poll()
+        if msg is not None:
+            if (
+                msg.type == "control_change"
+                and getattr(msg, "control", None) == control
+            ):
+                seen_values.add(getattr(msg, "value", 0))
+        else:
+            time.sleep(0.01)
+    return "knob_moved" if len(seen_values) >= 3 else "button_pressed"
+
+
+def capture_one_trigger(
+    port_name: str,
+    knob_ccs: set[int],
+    button_ccs: set[int],
+) -> tuple[str, str]:
+    """Capture one MIDI gesture.  Unknown CCs are auto-classified and the
+    caller's *knob_ccs* / *button_ccs* sets are updated in-place."""
     print("\nWaiting for one supported gesture...")
     print("Do one of these:")
     print("- move a knob")
@@ -260,7 +296,31 @@ def capture_one_trigger(port_name: str) -> tuple[str, str]:
                     print(f"Raw MIDI:  {pending_pad_hit.raw}")
                     return pending_pad_hit.id, pending_pad_hit.kind
 
-            event = normalize_message(msg, state)
+            event = normalize_message(
+                msg, state,
+                knob_ccs=frozenset(knob_ccs),
+                button_ccs=frozenset(button_ccs),
+            )
+
+            # Handle CC that isn't classified yet
+            if event is None and msg.type == "control_change":
+                control = getattr(msg, "control", None)
+                value = getattr(msg, "value", 0)
+                if control is not None and value > 0:
+                    kind = auto_classify_cc(port, control, value)
+                    if kind == "knob_moved":
+                        knob_ccs.add(control)
+                    else:
+                        button_ccs.add(control)
+                    event = NormalizedEvent(
+                        kind=kind,
+                        id=f"cc:{control}",
+                        raw=str(msg),
+                        control=control,
+                    )
+                    label = "knob" if kind == "knob_moved" else "button"
+                    print(f"Auto-detected CC {control} as {label}")
+
             if event is None:
                 continue
 
@@ -281,8 +341,191 @@ def capture_one_trigger(port_name: str) -> tuple[str, str]:
     raise RuntimeError("Input stream ended unexpectedly.")
 
 
+def find_desktop_apps() -> list[dict]:
+    """Scan .desktop files and return a list of launchable applications."""
+    import glob
+
+    dirs = [
+        "/usr/share/applications",
+        "/usr/local/share/applications",
+        os.path.expanduser("~/.local/share/applications"),
+        "/var/lib/flatpak/exports/share/applications",
+        os.path.expanduser("~/.local/share/flatpak/exports/share/applications"),
+    ]
+    apps: list[dict] = []
+    seen: set[str] = set()
+
+    for d in dirs:
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            try:
+                name = ""
+                exec_cmd = ""
+                wm_class = ""
+                no_display = False
+                with open(path, encoding="utf-8", errors="replace") as f:
+                    in_entry = False
+                    for line in f:
+                        line = line.strip()
+                        if line == "[Desktop Entry]":
+                            in_entry = True
+                            continue
+                        if line.startswith("[") and line.endswith("]"):
+                            in_entry = False
+                            continue
+                        if not in_entry:
+                            continue
+                        if line.startswith("Name=") and not name:
+                            name = line.split("=", 1)[1].strip()
+                        elif line.startswith("Exec="):
+                            exec_cmd = line.split("=", 1)[1].strip()
+                        elif line.startswith("StartupWMClass="):
+                            wm_class = line.split("=", 1)[1].strip()
+                        elif line.startswith("NoDisplay=true"):
+                            no_display = True
+                if no_display or not name or not exec_cmd:
+                    continue
+                key = name.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                # Strip field codes like %U %f etc.
+                launch = " ".join(
+                    tok for tok in exec_cmd.split() if not tok.startswith("%")
+                )
+                apps.append({
+                    "name": name,
+                    "exec": launch,
+                    "wm_class": wm_class,
+                })
+            except OSError:
+                continue
+
+    apps.sort(key=lambda a: a["name"].lower())
+    return apps
+
+
+def choose_action_command(trigger_label: str, existing_command: str = "") -> str:
+    """Present action templates and return the shell command string."""
+    print(f"\nWhat should '{trigger_label}' do?")
+    print("  1. Launch or focus an application")
+    print("  2. Open a named terminal slot (kitty)")
+    print("  3. Media playback control")
+    print("  4. Run a custom command")
+    print("  5. Open a URL")
+    if existing_command:
+        print(f"  Press Enter to keep: {existing_command}")
+
+    while True:
+        choice = input("Action type [1-5]: ").strip()
+        if choice == "" and existing_command:
+            return existing_command
+
+        if choice == "1":
+            return _choose_app_command()
+        if choice == "2":
+            return _choose_terminal_slot()
+        if choice == "3":
+            return _choose_media_command()
+        if choice == "4":
+            return _choose_custom_command()
+        if choice == "5":
+            return _choose_url_command()
+        print("Choose 1-5.")
+
+
+def _choose_app_command() -> str:
+    apps = find_desktop_apps()
+    if apps:
+        print("\nInstalled applications (showing first 20):")
+        shown = apps[:20]
+        for idx, app in enumerate(shown, start=1):
+            print(f"  {idx:2}. {app['name']}")
+        print(f"  {len(shown) + 1:2}. Search by name...")
+        print(f"  {len(shown) + 2:2}. Enter manually")
+
+        raw = input("Choose: ").strip()
+        try:
+            idx = int(raw)
+            if 1 <= idx <= len(shown):
+                app = shown[idx - 1]
+                wm = app["wm_class"] or app["name"]
+                return f"raise-or-launch --wm-class '{wm}' -- {app['exec']}"
+            if idx == len(shown) + 1:
+                query = input("Search: ").strip().lower()
+                matches = [a for a in apps if query in a["name"].lower()]
+                if not matches:
+                    print("No matches.")
+                else:
+                    for i, app in enumerate(matches[:15], start=1):
+                        print(f"  {i}. {app['name']}")
+                    raw2 = input("Choose: ").strip()
+                    try:
+                        idx2 = int(raw2)
+                        if 1 <= idx2 <= min(15, len(matches)):
+                            app = matches[idx2 - 1]
+                            wm = app["wm_class"] or app["name"]
+                            return f"raise-or-launch --wm-class '{wm}' -- {app['exec']}"
+                    except ValueError:
+                        pass
+        except ValueError:
+            pass
+
+    print("Enter the WM class (or app name) and launch command.")
+    wm_class = input("WM class: ").strip()
+    launch = input("Launch command: ").strip()
+    if wm_class and launch:
+        return f"raise-or-launch --wm-class '{wm_class}' -- {launch}"
+    if launch:
+        return launch
+    return ""
+
+
+def _choose_terminal_slot() -> str:
+    name = input("Terminal slot name (e.g. 'dev', 'logs', 'ssh-prod'): ").strip()
+    if not name:
+        name = "default"
+    return f"kitty-slot {name}"
+
+
+def _choose_media_command() -> str:
+    print("  1. Play / Pause")
+    print("  2. Next track")
+    print("  3. Previous track")
+    print("  4. Volume up")
+    print("  5. Volume down")
+    print("  6. Mute toggle")
+    while True:
+        choice = input("Media action [1-6]: ").strip()
+        cmds = {
+            "1": "playerctl play-pause",
+            "2": "playerctl next",
+            "3": "playerctl previous",
+            "4": "pactl set-sink-volume @DEFAULT_SINK@ +5%",
+            "5": "pactl set-sink-volume @DEFAULT_SINK@ -5%",
+            "6": "pactl set-sink-mute @DEFAULT_SINK@ toggle",
+        }
+        if choice in cmds:
+            return cmds[choice]
+        print("Choose 1-6.")
+
+
+def _choose_custom_command() -> str:
+    print("Enter any shell command:")
+    print("  Examples: notify-send 'Hello'  |  gnome-terminal  |  xdg-open https://example.com")
+    return input("Command: ").strip()
+
+
+def _choose_url_command() -> str:
+    url = input("URL to open: ").strip()
+    if url:
+        return f"xdg-open '{url}'"
+    return ""
+
+
 def main() -> None:
     config = load_config()
+    knob_ccs: set[int] = set(config.get("knob_ccs", []))
+    button_ccs: set[int] = set(config.get("button_ccs", []))
 
     if config.get("port"):
         print(f"Current MIDI port: {config['port']}")
@@ -308,19 +551,13 @@ def main() -> None:
         choice = input("Select: ").strip()
 
         if choice == "1":
-            trigger_id, kind = capture_one_trigger(config["port"])
+            trigger_id, kind = capture_one_trigger(config["port"], knob_ccs, button_ccs)
             label = describe_trigger(trigger_id, kind)
             existing = config["bindings"].get(trigger_id)
-            print(f"\nEnter the shell command to run for: {label} [{trigger_id}]")
-            print("Examples:")
-            print("  notify-send 'MIDI' 'Pad hit'")
-            print("  gnome-terminal")
-            print("  xdg-open https://chatgpt.com")
-            print("  playerctl play-pause")
+            existing_cmd = ""
             if existing and existing.get("command"):
-                print(f"Current command: {existing['command']}")
-            print()
-            cmd = input("Command: ").strip()
+                existing_cmd = existing["command"]
+            cmd = choose_action_command(label, existing_command=existing_cmd)
             existing_cooldown = None
             if existing is not None:
                 existing_cooldown = float(
@@ -390,6 +627,8 @@ def main() -> None:
             print(f"Now using MIDI port: {config['port']}")
 
         elif choice == "7":
+            config["knob_ccs"] = sorted(knob_ccs)
+            config["button_ccs"] = sorted(button_ccs)
             save_config(config)
             print(f"\nSaved config to: {CONFIG_PATH}")
             _, message = restart_execute_service()
@@ -406,3 +645,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

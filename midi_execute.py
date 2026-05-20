@@ -14,6 +14,7 @@ from midi_triggers_common import (
     ActivePadState,
     NormalizedEvent,
     canonicalize_port_name,
+    cc_sets_from_config,
     default_cooldown_for_kind,
     describe_trigger,
     normalize_message,
@@ -209,12 +210,15 @@ def main() -> None:
     state = ActivePadState()
     loaded_config: dict | None = None
     loaded_mtime = config_mtime_ns()
+    knob_ccs: frozenset[int] = frozenset()
+    button_ccs: frozenset[int] = frozenset()
 
     try:
         while True:
             if loaded_config is None:
                 loaded_config = load_config()
                 loaded_mtime = config_mtime_ns()
+                knob_ccs, button_ccs = cc_sets_from_config(loaded_config)
                 print_config_summary(loaded_config)
 
             configured_port_name = loaded_config["port"]
@@ -289,6 +293,7 @@ def main() -> None:
                                         loaded_config = reloaded
                                         bindings = loaded_config["bindings"]
                                         cooldowns = loaded_config.get("cooldowns", {})
+                                        knob_ccs, button_ccs = cc_sets_from_config(loaded_config)
                                         print_config_summary(loaded_config)
 
                         msg = port.poll()
@@ -296,7 +301,11 @@ def main() -> None:
                             time.sleep(0.01)
                             continue
 
-                        event = normalize_message(msg, state)
+                        event = normalize_message(
+                            msg, state,
+                            knob_ccs=knob_ccs,
+                            button_ccs=button_ccs,
+                        )
                         if event is None:
                             continue
 
@@ -329,3 +338,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
